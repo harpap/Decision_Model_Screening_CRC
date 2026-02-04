@@ -157,7 +157,7 @@
 		</maux>
 		<maux id="U">
 			<parents>V</parents>
-			<expression>1.01379-0.870491*Exp(-0.038973*V)</expression>
+			<expression>1.01379-0.870491*Exp(-0.005*V)</expression>
 		</maux>
 	</nodes>
 	<extensions>

@@ -26,6 +26,7 @@ calculate_info_values: True
 new_test: True 
 
 # --------- If new_test = True, the following parameters must be defined
+# TODO test names should be able to be changed in the API by the user. (Not only New_test_A and New_test_B)
 new_tests:
   New_Test_A:
     cost: 3

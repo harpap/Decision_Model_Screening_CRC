@@ -1,10 +1,12 @@
 import copy
 import logging
+import math
 import os
+import re
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -59,7 +61,139 @@ def _read_report(path: str) -> Optional[Dict[str, Dict[str, Any]]]:
     if not os.path.exists(path):
         return None
     df = pd.read_csv(path, index_col=0)
-    return df.to_dict(orient="index")
+    return _sanitize_data(df.to_dict(orient="index"))
+
+
+def _sanitize_data(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _sanitize_data(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_data(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_data(v) for v in value)
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def _read_csv(path: str, index_col: Optional[int] = None) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path, index_col=index_col)
+
+
+def _find_latest_run_folder(output_dir: str) -> Optional[str]:
+    candidate_dirs: List[str] = []
+    for root, _, files in os.walk(output_dir):
+        if any(name.startswith("use_case_") and name.endswith(".log") for name in files):
+            candidate_dirs.append(root)
+    if not candidate_dirs:
+        return None
+    return max(candidate_dirs, key=os.path.getmtime)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_counts_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    normalized = df.copy()
+    count_col = normalized.columns[-1]
+    if count_col != "count":
+        normalized = normalized.rename(columns={count_col: "count"})
+    return _sanitize_data(normalized.to_dict(orient="records"))
+
+
+def _compute_confusion_from_counts(df: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    if df is None or df.empty:
+        return None
+    required_columns = {"Final_decision", "CRC"}
+    if not required_columns.issubset(set(df.columns)):
+        return None
+
+    count_col = df.columns[-1]
+    if count_col in required_columns:
+        return None
+
+    values = df[["Final_decision", "CRC", count_col]].copy()
+    values["Final_decision"] = pd.to_numeric(values["Final_decision"], errors="coerce")
+    values["CRC"] = pd.to_numeric(values["CRC"], errors="coerce")
+    values[count_col] = pd.to_numeric(values[count_col], errors="coerce").fillna(0.0)
+
+    tn = int(values.loc[(values["CRC"] == 0) & (values["Final_decision"] == 0), count_col].sum())
+    fp = int(values.loc[(values["CRC"] == 0) & (values["Final_decision"] == 1), count_col].sum())
+    fn = int(values.loc[(values["CRC"] == 1) & (values["Final_decision"] == 0), count_col].sum())
+    tp = int(values.loc[(values["CRC"] == 1) & (values["Final_decision"] == 1), count_col].sum())
+
+    return {
+        "tn": tn,
+        "fp": fp,
+        "fn": fn,
+        "tp": tp,
+        "matrix": [[tn, fp], [fn, tp]],
+    }
+
+
+def _parse_costs_from_log(log_path: Optional[str]) -> Dict[str, Any]:
+    if not log_path or not os.path.exists(log_path):
+        return {}
+
+    sections = {
+        "New screening strategy with operational limits": "new_strategy_with_limits",
+        "Old screening strategy": "old_strategy",
+        "New screening strategy without operational limits": "new_strategy_without_limits",
+        "Comparison of the strategies (FIT age-based vs risk-based)": "comparison_strategy",
+    }
+    metrics = {
+        "Total cost of the strategy": "total_cost",
+        "Mean cost per screened participant": "mean_cost_per_screened_participant",
+        "Mean cost per individual in the total population": "mean_cost_per_population",
+        "Total time for the simulation": "total_time_seconds",
+        "Total number of colonoscopies performed": "colonoscopies_performed",
+    }
+
+    costs: Dict[str, Dict[str, Any]] = {}
+    current_section: Optional[str] = None
+    with open(log_path, "r", encoding="utf-8") as file:
+        for line in file:
+            for marker, section_name in sections.items():
+                if marker in line:
+                    current_section = section_name
+                    costs.setdefault(current_section, {})
+                    break
+
+            if current_section is None:
+                continue
+
+            for text, key in metrics.items():
+                if text not in line:
+                    continue
+
+                if key == "colonoscopies_performed":
+                    match = re.search(rf"{re.escape(text)}:\s*([0-9]+)", line)
+                else:
+                    match = re.search(rf"{re.escape(text)}:\s*([0-9,]+(?:\.[0-9]+)?)", line)
+                if match:
+                    numeric_value = _safe_float(match.group(1).replace(",", ""))
+                    if numeric_value is not None:
+                        costs[current_section][key] = (
+                            int(numeric_value) if key == "colonoscopies_performed" else numeric_value
+                        )
+
+    return costs
+
+
+def _read_screening_counts_variables(output_dir: str) -> Dict[str, Any]:
+    path = os.path.join(output_dir, "counts_possible_outcomes_operational_limit.csv")
+    df = _read_csv(path, index_col=0)
+    if df is None:
+        return {}
+    return _sanitize_data(df.to_dict(orient="index"))
 
 
 def _build_logger(log_file: str) -> logging.Logger:
@@ -130,9 +264,42 @@ def _collect_analytics(output_dir: str) -> Dict[str, Any]:
         if report is not None:
             reports[key] = report
 
+    latest_run_dir = _find_latest_run_folder(output_dir)
+
+    counts_files = {
+        "new_strategy_with_limits": "counts_new_w_lim.csv",
+        "new_strategy_without_limits": "counts_new.csv",
+        "old_strategy": "counts_old.csv",
+        "comparison_strategy": "counts_new_w_lim_comp.csv",
+    }
+
+    counts_variables: Dict[str, Any] = {}
+    confusion_matrices: Dict[str, Any] = {}
+    if latest_run_dir:
+        for key, filename in counts_files.items():
+            df_counts = _read_csv(os.path.join(latest_run_dir, filename))
+            if df_counts is None:
+                continue
+            counts_variables[key] = _normalize_counts_records(df_counts)
+            matrix = _compute_confusion_from_counts(df_counts)
+            if matrix is not None:
+                confusion_matrices[key] = matrix
+
+    log_path = None
+    if latest_run_dir:
+        for name in os.listdir(latest_run_dir):
+            if name.startswith("use_case_") and name.endswith(".log"):
+                log_path = os.path.join(latest_run_dir, name)
+                break
+
     return {
         "reports": reports,
-        "generated_files": sorted(os.listdir(output_dir)) if os.path.exists(output_dir) else [],
+        "variables": {
+            "screening_counts": _read_screening_counts_variables(output_dir),
+            "counts": counts_variables,
+            "confusion_matrices": confusion_matrices,
+            "costs": _parse_costs_from_log(log_path),
+        },
     }
 
 
